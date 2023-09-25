@@ -226,11 +226,3 @@ for (i in 1:nrow(df_sub)){
   dev.off()
 }
 ```
-
-```{r}
-colnames(df)
-```
-
-```{r}
-
-```
