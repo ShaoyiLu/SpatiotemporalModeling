@@ -1,0 +1,530 @@
+---
+title: "Abundance"
+output: html_document
+date: "2023-11-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE}
+library(MASS)
+library(forecast)
+library(FedData)
+library(sp)
+library(tidyverse)
+library(kableExtra)
+library(lubridate)
+library(broman)
+library(readr)
+library(broom)
+library(vroom)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(geodata)
+library(CropScapeR)
+library(raster)
+library(terra)
+library(prism)
+library(sf)
+library(pscl)
+library(zoo)
+library(segmented)
+```
+
+```{r}
+data = read.csv("../data/sorted data.csv")
+```
+
+```{r, echo=FALSE}
+colnames(data)
+```
+
+```{r}
+# model = lm(Abundance ~ potato_intensity + tavg + prec, data = data)
+# summary(model)
+```
+
+```{r, echo=FALSE}
+df_sub = data[data$Year >= 2007 & data$Year <= 2022 & data$category == "Potatoes", ]
+```
+
+```{r, echo=TRUE}
+nrow(df_sub)
+```
+
+
+```{r}
+unique_locations = unique(df_sub[, c("Lon", "Lat")])
+
+model_results = data.frame(Location = character(), Year = integer(), 
+                            Reported_abundance = numeric(), 
+                            Predicted_abundance = numeric())
+
+total_locations = nrow(unique_locations)
+total_years = length(unique(df_sub$Year))
+progress_counter = 0
+
+for (t in unique(df_sub$Year)) {
+  for (i in 1:total_locations) {
+    progress_counter = progress_counter + 1
+    current_data <- df_sub %>% filter(Year == t, 
+                                      Lon == unique_locations$Lon[i], 
+                                      Lat == unique_locations$Lat[i])
+    
+    if (nrow(current_data) > 0) {
+      predicted_abundance = mean(current_data$potato_intensity, na.rm = TRUE) + 
+                             mean(current_data$tavg, na.rm = TRUE) + 
+                             mean(current_data$prec, na.rm = TRUE)
+      
+      reported_abundance = mean(current_data$Abundance, na.rm = TRUE)
+
+      location_id <- paste(current_data$Lon[1], current_data$Lat[1], sep = "_")
+      
+      model_results = rbind(model_results, data.frame(Location = location_id, Year = t, 
+                                                       Reported_abundance = reported_abundance, 
+                                                       Predicted_abundance = predicted_abundance))
+    }
+
+    # print(paste("Processing location", i, "of", total_locations, "in Year", t, "-- Progress:", progress_counter, "of", total_locations * total_years, "(", round(progress_counter / (total_locations * total_years) * 100, 2), "%)"))
+  }
+}
+
+ggplot(model_results, aes(x = Predicted_abundance, y = Reported_abundance, color = as.factor(Year))) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  labs(title = "Reported vs Predicted Abundance", 
+       x = "Reported Abundance", 
+       y = "Predicted Abundance",
+       color = "Year")
+```
+
+```{r}
+p <- ggplot(model_results, aes(x = Predicted_abundance, y = Reported_abundance)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  labs(title = "Reported vs Predicted Abundance", 
+       x = "Predicted Abundance", 
+       y = "Reported Abundance") +
+  theme_minimal()
+
+p + facet_wrap(~ Year)
+```
+
+```{r}
+cor_test <- cor.test(model_results$Reported_abundance, model_results$Predicted_abundance)
+print(cor_test)
+
+lm_model <- lm(Reported_abundance ~ Predicted_abundance, data = model_results)
+lm_summary <- summary(lm_model)
+print(lm_summary)
+
+par(mfrow=c(2,2))
+plot(lm_model)
+
+boxplot(model_results$Reported_abundance, main = "Reported Abundance Boxplot")
+
+ggplot(model_results, aes(x = Reported_abundance)) + 
+  geom_density(fill = "blue", alpha = 0.5) + 
+  labs(title = "Density of Reported Abundance")
+
+model_results$Abundance_bin <- cut(model_results$Reported_abundance, breaks = 5)
+
+# lm_multi <- lm(Reported_abundance ~ Predicted_abundance + Other_predictor, data = model_results)
+# print(summary(lm_multi))
+
+#ts_data <- ts(model_results$Reported_abundance)
+#plot(ts_data)
+
+par(mfrow=c(1,1))
+```
+
+```{r}
+weight_vector <- sqrt((df_sub$potato_intensity - mean(df_sub$potato_intensity, na.rm = TRUE))^2)
+
+max_abundance <- max(df_sub$Abundance, na.rm = TRUE)
+abundance_gap <- seq(0, max_abundance, by = 0.5)
+
+abundance_means <- data.frame(
+  abundance_gap = head(abundance_gap, -1), 
+  potato_intensity_mean = numeric(length(abundance_gap) - 1),
+  tavg_mean = numeric(length(abundance_gap) - 1),
+  prec_mean = numeric(length(abundance_gap) - 1)
+)
+
+# Calculate the weighted means within each abundance gap
+for (i in seq_along(abundance_gap)[-length(abundance_gap)]) {
+  indices = which(df_sub$Abundance >= abundance_gap[i] & df_sub$Abundance < abundance_gap[i + 1])
+  
+  if (length(indices) > 0) {
+    selected_weights = weight_vector[indices]
+    abundance_means$potato_intensity_mean[i] = weighted.mean(df_sub$potato_intensity[indices], selected_weights, na.rm = TRUE)
+    abundance_means$tavg_mean[i] = mean(df_sub$tavg[indices], na.rm = TRUE)
+    abundance_means$prec_mean[i] = mean(df_sub$prec[indices], na.rm = TRUE)
+  }
+}
+
+abundance_means <- abundance_means[abundance_means$potato_intensity_mean != 0, ]
+
+fit = lm(potato_intensity_mean ~ poly(abundance_gap, 2, raw = TRUE), data = abundance_means)
+
+ggplot(abundance_means, aes(x = abundance_gap, y = potato_intensity_mean)) +
+  geom_point() +
+  geom_line(aes(y = predict(fit, newdata = abundance_means)), color = 'blue') +
+  labs(x = 'Abundance', y = 'Weighted Mean of Potato Intensity') +
+  theme_minimal()
+```
+
+```{r}
+df_sub$Date = as.character(df_sub$Date)
+df_sub$Date[df_sub$Date == "#######"] = NA
+df_sub$Date = as.Date(df_sub$Date, format = "%m/%d/%Y")
+df_sub$Date = na.locf(df_sub$Date, na.rm = FALSE)
+df_sub = df_sub[order(df_sub$Date),]
+
+
+df_sub$Calculated_Abundance = df_sub$potato_intensity + df_sub$tavg + df_sub$prec
+
+weight_vector = sqrt((df_sub$potato_intensity - mean(df_sub$potato_intensity, na.rm = TRUE))^2)
+
+max_calculated_abundance = max(df_sub$Calculated_Abundance, na.rm = TRUE)
+abundance_gap = seq(0, max_calculated_abundance, by = 0.5)
+
+abundance_means = data.frame(
+  abundance_gap = head(abundance_gap, -1), 
+  potato_intensity_mean = numeric(length(abundance_gap) - 1),
+  tavg_mean = numeric(length(abundance_gap) - 1),
+  prec_mean = numeric(length(abundance_gap) - 1),
+  abundance_mean = numeric(length(abundance_gap) - 1) 
+)
+
+for (i in seq_along(abundance_gap)[-length(abundance_gap)]) {
+  indices = which(df_sub$Calculated_Abundance >= abundance_gap[i] & df_sub$Calculated_Abundance < abundance_gap[i + 1])
+  
+  if (length(indices) > 0) {
+    selected_weights = weight_vector[indices]
+    selected_weights[selected_weights < .Machine$double.eps] = .Machine$double.eps
+    
+    abundance_means$potato_intensity_mean[i] = weighted.mean(df_sub$potato_intensity[indices], selected_weights, na.rm = TRUE)
+    abundance_means$tavg_mean[i] = weighted.mean(df_sub$tavg[indices], selected_weights, na.rm = TRUE)
+    abundance_means$prec_mean[i] = weighted.mean(df_sub$prec[indices], selected_weights, na.rm = TRUE)
+    abundance_means$abundance_mean[i] = weighted.mean(df_sub$Calculated_Abundance[indices], selected_weights, na.rm = TRUE)
+  }
+}
+
+fit = lm(abundance_mean ~ poly(abundance_gap, 2, raw = TRUE), data = abundance_means)
+
+ggplot(abundance_means, aes(x = abundance_gap, y = abundance_mean)) +
+  geom_point() +
+  geom_line(aes(y = predict(fit, newdata = abundance_means)), color = 'blue') +
+  labs(x = 'Abundance', y = 'Potato Intensity + tavg + prec') +
+  theme_minimal()
+```
+
+```{r}
+df_sub$Abundance <- df_sub$Abundance * 100
+
+model <- lm(Abundance ~ tavg + potato_intensity, data = df_sub)
+
+summary(model)
+
+df_sub$predicted_abundance = predict(model, newdata = df_sub)
+
+p = ggplot(df_sub, aes(x = tavg, y = Abundance)) +
+  geom_point(aes(color = potato_intensity), alpha = 0.5) + 
+  geom_line(aes(y = predicted_abundance), color = 'blue') + 
+  labs(x = "Average Temperature (tavg)", y = "Abundance (scaled by 100)", color = "Potato Intensity") +
+  theme_minimal()
+
+print(p)
+```
+
+
+```{r}
+#Logarithmic transformation
+
+# Log-transforming Calculated_Abundance by adding one
+df_sub$log_Calculated_Abundance <- log(df_sub$Calculated_Abundance + 1)
+
+# Fitting a linear model using the log-transformed data
+model_log <- lm(log_Calculated_Abundance ~ tavg + potato_intensity, data = df_sub)
+
+# Viewing the summary of the model
+summary(model_log)
+
+# Reverse transforming the model predictions to get the original scale predictions
+df_sub$predicted_abundance <- exp(predict(model_log, df_sub)) - 1
+
+# Plotting the predicted results
+ggplot(df_sub, aes(x = tavg, y = Calculated_Abundance)) +
+  geom_point(aes(color = potato_intensity), alpha = 0.5) +
+  geom_line(aes(y = predicted_abundance), color = 'blue') +
+  labs(x = "Average Temperature (tavg)", y = "Calculated Abundance", color = "Potato Intensity") +
+  theme_minimal()
+```
+
+```{r}
+# segmented regression
+
+base_model <- lm(Calculated_Abundance ~ tavg + potato_intensity, data = df_sub)
+
+seg_model <- segmented(base_model, seg.Z = ~ tavg, psi = list(tavg = c(10, 20)))
+
+summary(seg_model)
+
+slope(seg_model)
+
+plot(seg_model)
+```
+
+```{r}
+# Generalized Linear Models
+
+# Fitting a GLM with a Poisson distribution
+poisson_model <- glm(Calculated_Abundance ~ tavg + potato_intensity, 
+                     family = poisson, data = df_sub)
+
+# Viewing the summary of the model
+summary(poisson_model)
+
+# If data shows overdispersion (variance greater than mean), consider using negative binomial regression
+negbin_model <- glm.nb(Calculated_Abundance ~ tavg + potato_intensity, data = df_sub)
+
+# Viewing the summary of the model
+summary(negbin_model)
+
+# Plotting the fit of the models
+# Using the predict() function to obtain the predicted means
+df_sub$predicted_abundance_poisson <- predict(poisson_model, type = "response")
+df_sub$predicted_abundance_negbin <- predict(negbin_model, type = "response")
+
+# Creating plots with ggplot2
+p1 <- ggplot(df_sub, aes(x = tavg, y = Calculated_Abundance)) +
+  geom_point(aes(color = potato_intensity), alpha = 0.5) +
+  geom_line(aes(y = predicted_abundance_poisson), color = 'blue') +
+  labs(x = "Average Temperature (tavg)", y = "Calculated Abundance (Poisson Prediction)", color = "Potato Intensity") +
+  theme_minimal()
+
+p2 <- ggplot(df_sub, aes(x = tavg, y = Calculated_Abundance)) +
+  geom_point(aes(color = potato_intensity), alpha = 0.5) +
+  geom_line(aes(y = predicted_abundance_negbin), color = 'red') +
+  labs(x = "Average Temperature (tavg)", y = "Calculated Abundance (Negative Binomial Prediction)", color = "Potato Intensity") +
+  theme_minimal()
+
+# Print p1 and p2 to see the differences between Poisson and Negative Binomial predictions
+print(p1)
+print(p2)
+
+
+```
+
+```{r}
+# Inverse Gaussian Model
+
+# Ensuring no negatives or zeros as Gamma distribution is only applicable to positive numbers
+df_sub$Calculated_Abundance <- pmax(df_sub$Calculated_Abundance, .Machine$double.eps)
+
+# Fitting a GLM with a Gamma distribution
+gamma_model <- glm(Calculated_Abundance ~ tavg + potato_intensity, 
+                   family = Gamma(link = "inverse"), data = df_sub)
+
+# Viewing the summary of the model
+summary(gamma_model)
+
+# Fitting a GLM with an inverse Gaussian distribution
+invgauss_model <- glm(Calculated_Abundance ~ tavg + potato_intensity, 
+                      family = inverse.gaussian(link = "inverse"), data = df_sub)
+
+# Viewing the summary of the model
+summary(invgauss_model)
+
+# Plotting the fit of the models
+# Using the predict() function to obtain the predicted means
+df_sub$predicted_abundance_gamma <- predict(gamma_model, type = "response")
+df_sub$predicted_abundance_invgauss <- predict(invgauss_model, type = "response")
+
+# Creating plots with ggplot2
+p_gamma <- ggplot(df_sub, aes(x = tavg, y = Calculated_Abundance)) +
+  geom_point(aes(color = potato_intensity), alpha = 0.5) +
+  geom_line(aes(y = predicted_abundance_gamma), color = 'blue') +
+  labs(x = "Average Temperature (tavg)", y = "Calculated Abundance (Gamma Prediction)", color = "Potato Intensity") +
+  theme_minimal()
+
+p_invgauss <- ggplot(df_sub, aes(x = tavg, y = Calculated_Abundance)) +
+  geom_point(aes(color = potato_intensity), alpha = 0.5) +
+  geom_line(aes(y = predicted_abundance_invgauss), color = 'red') +
+  labs(x = "Average Temperature (tavg)", y = "Calculated Abundance (Inverse Gaussian Prediction)", color = "Potato Intensity") +
+  theme_minimal()
+
+# Print p_gamma and p_invgauss to see the differences between Gamma and Inverse Gaussian predictions
+print(p_gamma)
+print(p_invgauss)
+```
+
+
+```{r}
+df_sub$log_Calculated_Abundance <- log(df_sub$Calculated_Abundance + 1)
+
+model_log <- lm(log_Calculated_Abundance ~ tavg + potato_intensity, data = df_sub)
+
+summary(model_log)
+
+df_sub$predicted_abundance <- exp(predict(model_log, df_sub)) - 1
+
+ggplot(df_sub, aes(x = tavg, y = Calculated_Abundance)) +
+  geom_point(aes(color = potato_intensity), alpha = 0.5) +
+  geom_line(aes(y = predicted_abundance), color = 'blue') +
+  labs(x = "Average Temperature (tavg)", y = "Calculated Abundance", color = "Potato Intensity") +
+  theme_minimal()
+
+ggplot(df_sub, aes(x = tavg, y = Calculated_Abundance)) +
+  geom_point(aes(color = potato_intensity), alpha = 0.5) +
+  geom_smooth(method = "loess", color = 'blue', se = FALSE) +  
+  labs(x = "Average Temperature (tavg)", y = "Calculated Abundance", color = "Potato Intensity") +
+  theme_minimal()
+
+```
+
+```{r}
+
+
+```
+
+```{r}
+model <- lm(Abundance ~ tavg + potato_intensity, data = df_sub)
+
+summary(model)
+
+df_sub$predicted_abundance = predict(model, newdata = df_sub)
+
+p = ggplot(df_sub, aes(x = Site, y = Abundance)) +
+  geom_point(aes(color = potato_intensity), alpha = 0.5) + 
+  geom_line(aes(y = predicted_abundance), color = 'blue') + 
+  labs(x = "potato intensity", y = "Abundance (scaled by 100)", color = "Potato Intensity") +
+  theme_minimal()
+
+print(p)
+```
+
+```{r}
+# First, ensure the data is sorted by date
+df_sub <- df_sub[order(df_sub$Date), ]
+
+# Create a time series object, assuming the data is continuous and has a fixed frequency
+# The freq parameter depends on the interval of the data (e.g., if the data is monthly, then freq=12)
+abundance_ts <- ts(df_sub$Abundance, frequency = 12)
+
+# Check the time series plot
+plot(abundance_ts, main = "Abundance Over Time", xlab = "Time", ylab = "Abundance")
+
+# Fit the data using an automatic ARIMA model
+fit <- auto.arima(abundance_ts)
+
+# View the summary of the fitted model
+summary(fit)
+
+# Predict future values, here h is the number of time points you want to predict
+forecasts <- forecast(fit, h = 12)
+
+# View the forecast
+plot(forecasts)
+```
+
+```{r}
+history_data <- data.frame(
+  Time = 1:length(abundance_ts),
+  Value = as.numeric(abundance_ts)
+)
+
+forecast_data <- data.frame(
+  Time = length(abundance_ts) + 1:length(forecasts$mean),
+  Value = as.numeric(forecasts$mean)
+)
+
+total_data <- rbind(history_data, forecast_data)
+
+p <- ggplot(total_data, aes(x = Time, y = Value)) +
+  geom_line() +  
+  geom_line(data = forecast_data, color = "blue") +  
+  geom_smooth(method = "loess", span = 0.2, se = FALSE, color = "red") +
+  labs(x = "Time", y = "Value", title = "Forecasts from ARIMA Model with Trend") +
+  theme_minimal()
+
+print(p)
+```
+
+```{r}
+p <- ggplot(df_sub, aes(x = Date, y = Abundance, group = Year, color = Year)) +
+  geom_line(alpha = 0.3) +
+  geom_smooth(method = "lm", se = FALSE) +  
+  labs(x = "Date", y = "Abundance", title = "Annual Trends in Abundance") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(p)
+```
+
+```{r}
+p <- ggplot(df_sub[df_sub$Year == "2007", ], aes(x = Date, y = Abundance)) +
+  geom_point() +
+  geom_smooth(method = "loess", se = FALSE, color = "red", span = 1) +
+  labs(x = "Date", y = "Abundance", title = "2007 Annual Trend in Abundance") +
+  theme_minimal()
+
+print(p)
+```
+
+```{r}
+p <- ggplot(df_sub[df_sub$Year == "2007", ], aes(x = Date, y = Abundance)) +
+  geom_point() + 
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = FALSE, color = "red", span = 0.1) +  # polynomial
+  labs(x = "Date", y = "Abundance", title = "2007 Annual Trend in Abundance with Polynomial Fit") +
+  theme_minimal()
+
+print(p)
+```
+
+```{r}
+plot_year <- function(df, year) {
+  df %>% 
+    filter(year(Date) == year) %>% 
+    ggplot(aes(x = Date, y = Abundance)) +
+    geom_point() +
+    geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = FALSE, color = "red") +  # polynomial
+    labs(x = "Date", y = "Abundance", title = paste(year, "Annual Trend in Abundance with Polynomial Fit")) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+}
+
+
+unique_years <- unique(year(df_sub$Date))
+for (yr in unique_years) {
+  print(plot_year(df_sub, yr))
+}
+
+history_data <- data.frame(
+  Time = time(abundance_ts),
+  Value = as.numeric(abundance_ts)
+)
+
+forecast_data <- data.frame(
+  Time = time(forecasts$mean) + max(time(abundance_ts)),
+  Value = forecasts$mean
+)
+
+p_forecast <- ggplot(history_data, aes(x = Time, y = Value)) +
+  geom_point() +  
+  geom_line(data = forecast_data, aes(x = Time, y = Value), color = "blue") +  
+  geom_smooth(data = history_data, aes(x = Time, y = Value), method = "loess", span = 0.2, se = FALSE, color = "red") +
+  labs(x = "Time", y = "Value", title = "Forecasts from ARIMA Model with Trend") +
+  theme_minimal()
+
+print(p_forecast)
+```
+
+```{r}
+
+```
+
